@@ -61,6 +61,8 @@ body.tree-on #treeWrap{display:block}
 #gear{position:fixed;z-index:5;top:14px;right:14px;width:36px;height:36px;border-radius:50%;padding:0;
   background:var(--ui);border:1px solid var(--line);color:var(--ink);font-size:18px;cursor:pointer;transition:opacity .4s}
 body.overlay.idle #gear{opacity:0;pointer-events:none}
+body.receiver #gear,body.receiver #settings{display:none!important}
+#linkStatus{font-size:13px;line-height:1.4}
 #settings{position:fixed;z-index:5;top:58px;right:14px;width:310px;max-width:calc(100% - 28px);max-height:calc(100% - 72px);
   overflow:auto;background:var(--ui);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:13px;
   display:none;cursor:default}
@@ -138,6 +140,7 @@ body.picking #picker{display:flex}
 <button id="gear" title="Settings (S)">⚙</button>
 <div id="settings">
   <h2>Live Munsell Overlay</h2>
+  <div class="field"><span>Ecamm link</span><div id="linkStatus">Starting…</div></div>
   <label class="field"><span>Camera</span><select id="srcSel"></select></label>
   <div class="btns" style="margin-top:-4px"><button id="camRefresh">Refresh camera list</button><button id="camPick">Show camera chooser</button></div>
   <label class="check"><input type="checkbox" id="showSrc"> Show camera underneath (off in Ecamm)</label>
@@ -176,7 +179,7 @@ body.picking #picker{display:flex}
   </div>
   <div class="hint">
     <p>Drag the crosshair, or click anywhere to move it there.</p>
-    <p>For Ecamm: add <code>?overlay</code> to the end of the address, set the widget to Fill Entire Frame, and turn on Interact only while adjusting.</p>
+    <p>For Ecamm: keep this page open in Chrome. In Ecamm, add a Web Widget with this same address plus <code>?overlay</code> at the end and set it to Fill Entire Frame. It shows the crosshair, readout and tree from this page. Turn on Interact only to drag the crosshair.</p>
     <p>Readings are approximate Munsell notation from the camera. Lock your camera's white balance and calibrate on a grey card for the best accuracy.</p>
   </div>
 </div>
@@ -191,6 +194,8 @@ body.picking #picker{display:flex}
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"
+  onerror="var s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js';document.head.appendChild(s)"></script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
@@ -201,6 +206,10 @@ body.picking #picker{display:flex}
   try { const s = JSON.parse(localStorage.getItem(KEY) || 'null'); if (s) Object.assign(st, s); } catch (e) {}
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {} };
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  // ?overlay = the display copy for Ecamm: no camera, it draws what the Chrome copy measures.
+  // ?overlay&camera = old behaviour (the widget opens the camera itself).
+  let receiver = qs.has('overlay') && !qs.has('camera');
+  if (receiver) body.classList.add('receiver');
 
   // ---------- Color math ----------
   const LIN = new Float32Array(256);
@@ -243,15 +252,18 @@ body.picking #picker{display:flex}
 
   // ---------- Elements & layout ----------
   const video = $('video'), demo = $('demo'), cross = $('cross'), areaBox = $('area'), panel = $('panel');
-  let source = null;
+  let source = null, remoteDims = null;
   const srcDims = () => {
     if (!source) return null;
-    if (source === video) return video.videoWidth ? [video.videoWidth, video.videoHeight] : null;
+    if (source === video) {
+      if (latestFrame) return [latestFrame.displayWidth, latestFrame.displayHeight];
+      return video.videoWidth ? [video.videoWidth, video.videoHeight] : null;
+    }
     return [demo.width, demo.height];
   };
   // Matches "object-fit: cover" / Ecamm "Fill Entire Frame"
   const cover = () => {
-    const d = srcDims(); if (!d) return null;
+    const d = receiver ? remoteDims : srcDims(); if (!d) return null;
     const W = innerWidth, H = innerHeight, s = Math.max(W / d[0], H / d[1]);
     return { sw: d[0], sh: d[1], s, ox: (W - d[0] * s) / 2, oy: (H - d[1] * s) / 2 };
   };
@@ -286,7 +298,7 @@ body.picking #picker{display:flex}
     const c = cover(); if (!c) return;
     const aw = AW, ah = Math.max(1, Math.round(AW * c.sh / c.sw));
     if (ac.width !== aw || ac.height !== ah) { ac.width = aw; ac.height = ah; }
-    actx.drawImage(source, 0, 0, aw, ah);
+    actx.drawImage(source === video && latestFrame ? latestFrame : source, 0, 0, aw, ah);
     const d = actx.getImageData(0, 0, aw, ah).data;
     const [gr, gg, gb] = st.gains;
 
@@ -335,7 +347,11 @@ body.picking #picker{display:flex}
   function render() {
     if (smooth) {
       const cal = smooth.map((v, i) => Math.min(1, v * st.gains[i]));
-      const m = munsell(cal[0], cal[1], cal[2]);
+      showReading(munsell(cal[0], cal[1], cal[2]), cal);
+    }
+  }
+  function showReading(m, cal) {
+    {
       $('swatch').style.background = `rgb(${toSRGB(cal[0])},${toSRGB(cal[1])},${toSRGB(cal[2])})`;
       const V = Math.round(m.V), C = Math.round(m.C);
       $('notation').textContent = m.C < 0.75 ? `N ${V}/` : `${hueName(m.H)} ${V}/${Math.max(1, C)}`;
@@ -407,8 +423,9 @@ body.picking #picker{display:flex}
     }
 
     // Painting's colors as dots, back to front
-    const src = st.treeAcc ? history : current;
-    let total = 0; for (const e of current.values()) total += e.n;
+    const src = receiver ? remoteBins : st.treeAcc ? history : current;
+    let total = 0;
+    if (receiver) total = remoteTotal; else for (const e of current.values()) total += e.n;
     total = Math.max(1, total);
     const dots = [];
     for (const [key, e] of src) {
@@ -437,12 +454,19 @@ body.picking #picker{display:flex}
   }
   requestAnimationFrame(drawTree);
 
-  setInterval(() => { try { analyze(); } catch (e) {} }, 120);
+  function startTicker(fn, ms) {
+    // A worker's timer isn't slowed down when the Chrome window is in the background
+    try {
+      const w = new Worker(URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${ms})`], { type: 'text/javascript' })));
+      w.onmessage = fn;
+    } catch (e) { setInterval(fn, ms); }
+  }
+  startTicker(() => { if (receiver) return; try { analyze(); sendState(); } catch (e) {} }, 120);
 
   // ---------- Pointer: crosshair & canvas area ----------
   let dragging = false, areaMode = 0, areaFirst = null;
   const toSource = (x, y) => { const c = cover(); if (!c) return null; const [u, v] = v2s(x, y, c); return [clamp(u, 0, 1), clamp(v, 0, 1)]; };
-  const moveTo = (x, y) => { const p = toSource(x, y); if (!p) return; [st.x, st.y] = p; layout(); };
+  const moveTo = (x, y) => { const p = toSource(x, y); if (!p) return; [st.x, st.y] = p; layout(); if (receiver) sendMove(); };
 
   cross.addEventListener('pointerdown', e => { if (areaMode) return; dragging = true; cross.setPointerCapture(e.pointerId); e.stopPropagation(); });
   cross.addEventListener('pointermove', e => { if (dragging) moveTo(e.clientX, e.clientY); });
@@ -518,7 +542,26 @@ body.picking #picker{display:flex}
   // ---------- Sources ----------
   const srcSel = $('srcSel');
   let stream = null;
-  const stopStream = () => { if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; };
+  let frameReader = null, latestFrame = null;
+  const stopFrames = () => {
+    if (frameReader) { try { frameReader.cancel(); } catch (e) {} frameReader = null; }
+    if (latestFrame) { try { latestFrame.close(); } catch (e) {} latestFrame = null; }
+  };
+  async function startFrames(track) {
+    // Reads camera frames directly, so measuring continues even when the Chrome window is hidden
+    if (!('MediaStreamTrackProcessor' in window)) return;
+    try {
+      const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+      frameReader = reader;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || frameReader !== reader) { if (value) value.close(); break; }
+        if (latestFrame) latestFrame.close();
+        latestFrame = value;
+      }
+    } catch (e) {}
+  }
+  const stopStream = () => { stopFrames(); if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; };
   function setSource(el) {
     source = el; smooth = null;
     video.classList.toggle('active', el === video); demo.classList.toggle('active', el === demo);
@@ -578,6 +621,7 @@ body.picking #picker{display:flex}
       stopStream(); next = await openStream(id); // some cameras can't be opened twice
     }
     stopStream(); stream = next;
+    startFrames(stream.getVideoTracks()[0]);
     video.srcObject = stream;
     await new Promise(res => { if (video.readyState >= 1) res(); else video.onloadedmetadata = res; });
     try { await video.play(); } catch (e) {}
@@ -629,13 +673,17 @@ body.picking #picker{display:flex}
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', () => { listCameras(); });
 
   async function start() {
-    if (qs.has('demo') || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    const noCam = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    if (noCam && !qs.has('demo')) return becomeReceiver();
+    if (qs.has('demo') || noCam) {
       await useDemo();
       if (!qs.has('demo')) toast('Camera isn’t available here — showing a demo painting', 4500);
       return;
     }
     try { await useCamera(st.deviceId); }
     catch (e) {
+      // Camera blocked (e.g. inside Ecamm's Web Widget): switch to the display copy automatically
+      if (e && ['NotAllowedError', 'SecurityError', 'NotSupportedError'].includes(e.name) && !qs.has('demo')) return becomeReceiver();
       lastErr = camError(e);
       let ok = false;
       if (st.deviceId && e.name !== 'NotAllowedError') { try { await useCamera(''); ok = true; } catch (e2) { lastErr = camError(e2); } }
@@ -666,8 +714,122 @@ body.picking #picker{display:flex}
     demoImg.onload = () => { if (source === demo && !usingPhoto) { fitToFrame(demoImg); history.clear(); } };
   }
 
+  // ---------- Link between the Chrome copy and the Ecamm copy ----------
+  const ROOM = (qs.get('room') || 'pochadepalette1884-munsell').replace(/[^\w-]/g, '');
+  const peerOpts = qs.get('peerhost')
+    ? { host: qs.get('peerhost'), port: +(qs.get('peerport') || 9000), path: qs.get('peerpath') || '/', secure: false }
+    : {};
+  const setLink = t => { const el = $('linkStatus'); if (el) el.textContent = t; };
+  let conns = [], tick = 0, readerPeer = null;
+
+  // Chrome copy: waits for the Ecamm widget to connect, then sends readings
+  function startReaderLink() {
+    if (receiver) return;
+    if (!window.Peer) { setLink('Waiting for the link to load…'); return setTimeout(startReaderLink, 2000); }
+    const peer = readerPeer = new Peer(ROOM, peerOpts);
+    const waiting = () => setLink(conns.length ? `Connected to Ecamm (${conns.length})` : 'Ready. Waiting for the Ecamm widget.');
+    peer.on('open', waiting);
+    peer.on('connection', c => {
+      c.on('open', () => {
+        // One connection per widget: drop older ones from the same widget
+        conns.filter(x => x.peer === c.peer).forEach(x => { try { x.close(); } catch (e) {} });
+        conns = conns.filter(x => x.peer !== c.peer); conns.push(c); waiting();
+      });
+      c.on('data', d => { if (d && d.t === 'move') { st.x = clamp(+d.x, 0, 1); st.y = clamp(+d.y, 0, 1); smooth = null; layout(); save(); } });
+      c.on('close', () => { conns = conns.filter(x => x !== c); waiting(); });
+      c.on('error', () => {});
+    });
+    peer.on('disconnected', () => { try { if (!peer.destroyed) peer.reconnect(); } catch (e) {} });
+    peer.on('error', e => {
+      if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
+        setLink(e.type === 'unavailable-id' ? 'Another copy of this page is already open in Chrome. Close it, or retrying…' : 'Reconnecting…');
+        try { peer.destroy(); } catch (_) {}
+        setTimeout(startReaderLink, 4000);
+      }
+    });
+  }
+  function sendState() {
+    conns = conns.filter(c => c.open);
+    if (!conns.length || !crossM) return;
+    const c = cover();
+    const msg = { t: 's', x: st.x, y: st.y, sw: c ? c.sw : 16, sh: c ? c.sh : 9, rgb: crossRGB,
+      m: { V: crossM.V, C: crossM.C, H: crossM.H }, corner: st.corner, size: st.size, tree: st.tree, spin: st.treeSpin, sample: st.sample };
+    if (tick++ % 4 === 0 && st.tree) {
+      const src = st.treeAcc ? history : current;
+      let total = 0; for (const e of current.values()) total += e.n;
+      msg.total = total;
+      msg.bins = [...src].map(([k, e]) => [k, e.n, +(e.r / e.n).toFixed(4), +(e.g / e.n).toFixed(4), +(e.b / e.n).toFixed(4)]);
+    }
+    for (const cn of conns) { try { cn.send(msg); } catch (e) {} }
+  }
+
+  // Ecamm copy: connects to Chrome and draws what it receives
+  let rcvPeer = null, rcvConn = null, tryConn = null, lastMsg = 0, lastTry = 0, remoteBins = new Map(), remoteTotal = 1;
+  const waitMsg = t => { if (Date.now() - lastMsg > 3000) { $('notation').textContent = '—'; $('detail').textContent = t; } };
+  function startReceiver() {
+    if (!window.Peer) { waitMsg('Loading the link…'); return setTimeout(startReceiver, 2000); }
+    rcvPeer = new Peer(peerOpts);
+    rcvPeer.on('open', connect);
+    rcvPeer.on('disconnected', () => { try { if (!rcvPeer.destroyed) rcvPeer.reconnect(); } catch (e) {} });
+    rcvPeer.on('error', e => {
+      if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
+        try { rcvPeer.destroy(); } catch (_) {}
+        rcvPeer = null; setTimeout(startReceiver, 4000);
+      }
+    });
+  }
+  function connect() {
+    if (!rcvPeer || rcvPeer.destroyed || !rcvPeer.open) return;
+    lastTry = Date.now();
+    if (tryConn && !tryConn.open) { try { tryConn.close(); } catch (e) {} }
+    const c = tryConn = rcvPeer.connect(ROOM, { serialization: 'json' });
+    c.on('open', () => { rcvConn = c; });
+    c.on('data', applyRemote);
+    c.on('close', () => { if (rcvConn === c) rcvConn = null; });
+    c.on('error', () => {});
+  }
+  function sendMove() { if (rcvConn && rcvConn.open) try { rcvConn.send({ t: 'move', x: st.x, y: st.y }); } catch (e) {} }
+  function applyRemote(d) {
+    if (!d || d.t !== 's') return;
+    lastMsg = Date.now();
+    remoteDims = [d.sw, d.sh];
+    if (!dragging) { st.x = d.x; st.y = d.y; }
+    Object.assign(st, { corner: d.corner, size: d.size, tree: d.tree, treeSpin: d.spin, sample: d.sample });
+    if (d.m && d.rgb) showReading(d.m, d.rgb);
+    if (d.bins) {
+      remoteBins = new Map(d.bins.map(([k, n, r, g, b]) => [k, { n, r: r * n, g: g * n, b: b * n }]));
+      remoteTotal = Math.max(1, d.total || 1);
+    }
+    layout();
+  }
+
+  let displayStarted = false;
+  function startDisplay() {
+    if (displayStarted) return; displayStarted = true;
+    waitMsg('Waiting for the Chrome page…');
+    startReceiver();
+    // Keep trying until the Chrome page is open, and reconnect if it goes quiet
+    setInterval(() => {
+      waitMsg('Waiting for the Chrome page… Keep the overlay open in Chrome with your easel camera.');
+      if (Date.now() - lastMsg > 6000 && rcvConn) { try { rcvConn.close(); } catch (e) {} rcvConn = null; }
+      if (!rcvConn && rcvPeer && rcvPeer.open && Date.now() - lastTry > 4000) connect();
+    }, 2000);
+  }
+  function becomeReceiver() {
+    if (displayStarted) return;
+    receiver = true;
+    body.classList.add('receiver'); body.classList.remove('picking', 'settings-open');
+    transparent = true; applyMode();
+    stopStream(); source = null; smooth = null; crossM = null;
+    video.classList.remove('active'); demo.classList.remove('active');
+    if (readerPeer) { try { readerPeer.destroy(); } catch (e) {} readerPeer = null; }
+    layout();
+    startDisplay();
+  }
+
   layout();
-  start();
+  if (receiver) startDisplay();
+  else start().then(() => { if (!receiver) startReaderLink(); }); // the link starts only once a camera works here
 })();
 </script>
 </body>
