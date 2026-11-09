@@ -763,13 +763,18 @@ body.picking #picker{display:flex}
     const c = cover();
     const msg = { t: 's', x: st.x, y: st.y, sw: c ? c.sw : 16, sh: c ? c.sh : 9, rgb: crossRGB,
       m: { V: crossM.V, C: crossM.C, H: crossM.H }, corner: st.corner, size: st.size, tree: st.tree, spin: st.treeSpin, sample: st.sample };
-    if (tick++ % 4 === 0 && st.tree) {
+    const out = [msg];
+    if (tick++ % 5 === 0 && st.tree) {
+      // Tree colors go in small, compact pieces: Ecamm's built-in browser drops large messages
       const src = st.treeAcc ? history : current;
       let total = 0; for (const e of current.values()) total += e.n;
-      msg.total = total;
-      msg.bins = [...src].map(([k, e]) => [k, e.n, +(e.r / e.n).toFixed(4), +(e.g / e.n).toFixed(4), +(e.b / e.n).toFixed(4)]);
+      const list = [...src].sort((a, b) => b[1].n - a[1].n).slice(0, 900);
+      const flat = [];
+      for (const [k, e] of list) flat.push(k, e.n, Math.round(e.r / e.n * 1000), Math.round(e.g / e.n * 1000), Math.round(e.b / e.n * 1000));
+      const PER = 150 * 5, parts = Math.max(1, Math.ceil(flat.length / PER)), id = tick;
+      for (let i = 0; i < parts; i++) out.push({ t: 'b', id, i, n: parts, total, d: flat.slice(i * PER, (i + 1) * PER) });
     }
-    for (const cn of conns) { try { cn.send(msg); } catch (e) {} }
+    for (const cn of conns) for (const m of out) { try { cn.send(m); } catch (e) {} }
   }
 
   // Ecamm copy: connects to Chrome and draws what it receives
@@ -798,17 +803,28 @@ body.picking #picker{display:flex}
     c.on('error', () => {});
   }
   function sendMove() { if (rcvConn && rcvConn.open) try { rcvConn.send({ t: 'move', x: st.x, y: st.y }); } catch (e) {} }
+  let treeParts = null;
   function applyRemote(d) {
+    if (d && d.t === 'b') {
+      // Reassemble the tree from its pieces; show it once all pieces of a set have arrived
+      if (!treeParts || treeParts.id !== d.id) treeParts = { id: d.id, got: 0, n: d.n, parts: [] };
+      if (!treeParts.parts[d.i]) { treeParts.parts[d.i] = d.d; treeParts.got++; }
+      if (treeParts.got === treeParts.n) {
+        const m = new Map(), f = [].concat(...treeParts.parts);
+        for (let j = 0; j + 4 < f.length; j += 5) {
+          const n = f[j + 1];
+          m.set(f[j], { n, r: f[j + 2] / 1000 * n, g: f[j + 3] / 1000 * n, b: f[j + 4] / 1000 * n });
+        }
+        remoteBins = m; remoteTotal = Math.max(1, d.total || 1); treeParts = null;
+      }
+      return;
+    }
     if (!d || d.t !== 's') return;
     lastMsg = Date.now();
     remoteDims = [d.sw, d.sh];
     if (!dragging) { st.x = d.x; st.y = d.y; }
     Object.assign(st, { corner: d.corner, size: d.size, tree: d.tree, treeSpin: d.spin, sample: d.sample });
     if (d.m && d.rgb) showReading(d.m, d.rgb);
-    if (d.bins) {
-      remoteBins = new Map(d.bins.map(([k, n, r, g, b]) => [k, { n, r: r * n, g: g * n, b: b * n }]));
-      remoteTotal = Math.max(1, d.total || 1);
-    }
     layout();
   }
 
