@@ -564,6 +564,7 @@ body.picking #picker{display:flex}
   const stopStream = () => { stopFrames(); if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; };
   function setSource(el) {
     source = el; smooth = null;
+    syncReaderLink();
     video.classList.toggle('active', el === video); demo.classList.toggle('active', el === demo);
     layout();
   }
@@ -715,16 +716,23 @@ body.picking #picker{display:flex}
   }
 
   // ---------- Link between the Chrome copy and the Ecamm copy ----------
-  const ROOM = (qs.get('room') || 'pochadepalette1884-munsell').replace(/[^\w-]/g, '');
+  const ROOM = (qs.get('room') || 'pochadepalette1884-munsell-v3').replace(/[^\w-]/g, '');
   const peerOpts = qs.get('peerhost')
     ? { host: qs.get('peerhost'), port: +(qs.get('peerport') || 9000), path: qs.get('peerpath') || '/', secure: false }
     : {};
   const setLink = t => { const el = $('linkStatus'); if (el) el.textContent = t; };
   let conns = [], tick = 0, readerPeer = null;
 
-  // Chrome copy: waits for the Ecamm widget to connect, then sends readings
+  // Chrome copy: waits for the Ecamm widget to connect, then sends readings.
+  // Only a live camera sends; a copy showing the demo or a photo stays off the link.
+  function syncReaderLink() {
+    if (!receiver && source === video) { if (!readerPeer) startReaderLink(); return; }
+    if (readerPeer) { try { readerPeer.destroy(); } catch (e) {} readerPeer = null; }
+    conns = [];
+    if (!receiver) setLink('Off. Choose a live camera to send readings to Ecamm.');
+  }
   function startReaderLink() {
-    if (receiver) return;
+    if (receiver || source !== video || readerPeer) return;
     if (!window.Peer) { setLink('Waiting for the link to load…'); return setTimeout(startReaderLink, 2000); }
     const peer = readerPeer = new Peer(ROOM, peerOpts);
     const waiting = () => setLink(conns.length ? `Connected to Ecamm (${conns.length})` : 'Ready. Waiting for the Ecamm widget.');
@@ -744,6 +752,7 @@ body.picking #picker{display:flex}
       if (['unavailable-id', 'network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
         setLink(e.type === 'unavailable-id' ? 'Another copy of this page is already open in Chrome. Close it, or retrying…' : 'Reconnecting…');
         try { peer.destroy(); } catch (_) {}
+        if (readerPeer === peer) readerPeer = null;
         setTimeout(startReaderLink, 4000);
       }
     });
@@ -829,7 +838,7 @@ body.picking #picker{display:flex}
 
   layout();
   if (receiver) startDisplay();
-  else start().then(() => { if (!receiver) startReaderLink(); }); // the link starts only once a camera works here
+  else start(); // the link turns on by itself once a live camera is running here
 })();
 </script>
 </body>
